@@ -1,74 +1,63 @@
-# mAI ComfyUI Node Template
+# mAI Tiling Utils
 
-Base folder for creating a new ComfyUI custom node pack.
+ComfyUI custom nodes for splitting images into overlapping tiles and stitching
+processed tiles back into a full image.
 
-Copy this folder into:
-
-```text
-C:\AI\ComfyUIOpti\ComfyUICuda13\ComfyUI\custom_nodes
-```
-
-Then rename it, for example:
+## Nodes
 
 ```text
-mAI_ImageBrowser
-mAI_BlurAwareMaskTools
-mAI_FrameCanvasRecut
+mAI Image To Tiles
+mAI Tiles To Image
 ```
 
-## Included
+Both nodes are registered under:
 
 ```text
-__init__.py                    ComfyUI node registration
-nodes/example_text_node.py      Minimal example node
-utils/                          Shared helper code folder
-web/js/                         Optional ComfyUI frontend extension folder
-examples/                       Example workflows or screenshots
-tests/                          Small pure Python tests
-docs/                           Notes and Codex prompts
-AGENTS.md                       Instructions Codex should follow
-HOWTO_GIT_CODEX.md              Setup guide for Git and Codex
-SETUP_GIT_FOR_CODEX.bat         Easiest Windows setup script for Git + GitHub + Codex
-scripts/init_git.ps1            Optional PowerShell helper script for Git setup
+mAI/tiling
 ```
 
-## Minimal node behavior
+## Scaled Tile Stitching
 
-The example node takes a string and returns a cleaned string.
-It is intentionally simple so you can replace it with the real node logic.
+`mAI Tiles To Image` supports processed tiles that are larger or smaller than
+the original tiles produced by `mAI Image To Tiles`.
 
-After copying this folder into `custom_nodes`, restart ComfyUI and look for:
+Example 4x workflow:
 
 ```text
-mAI / Template / Example Text Node
+Input Image
+-> mAI Image To Tiles, tile size 512x512, overlap 64
+-> custom PiD/upscale workflow, output tile size 2048x2048
+-> mAI Tiles To Image, scale_mode auto
+-> final stitched 4x image
 ```
 
-## Development rule
-
-Keep each custom node pack as its own Git repo.
-Do not make your full ComfyUI install the repo.
-
-
-## Fast Windows setup
-
-After copying and renaming this folder, double-click:
+Recommended settings:
 
 ```text
-SETUP_GIT_FOR_CODEX.bat
+tile_width: 512
+tile_height: 512
+overlap: 64 or 128
+blend_mode: gradient_feathering
+scale_mode: auto
 ```
 
-It will initialize Git, create the `main` branch, commit the template, ask for your GitHub remote URL, and push if possible.
+The stitcher reads the original tile size from `tile_layout` and the processed
+tile size from the incoming `tiles` tensor. In `auto` mode it detects the scale
+factor from those sizes. In `manual` mode it uses `manual_scale` and validates
+that the processed tile dimensions match.
 
-It cannot create the GitHub repository for you unless you use extra tools like GitHub CLI, so create an empty repo on GitHub first.
+The stitcher does not resize, crop, or stretch tiles. It only places and blends
+the processed tiles it receives.
 
+## Requirements
 
-## One-click GitHub setup
+Processed tiles must keep the same aspect ratio as the original tiles. For
+example, tiles split at `512x512` can be stitched after processing to
+`2048x2048`, but not to `2048x1024`.
 
-The BAT file can create the GitHub repo automatically if GitHub CLI is installed and authenticated:
+The scaled output dimensions must be exact integers. If the tile scale would
+produce fractional canvas, crop, or tile-coordinate sizes, the stitcher raises a
+clear error instead of guessing.
 
-```powershell
-winget install --id GitHub.cli
-gh auth login
-```
-
-Then double-click `SETUP_GIT_FOR_CODEX.bat`. It can create the remote repo, add it as `origin`, and push `main`.
+Overlap is strongly recommended to reduce seams. Use `gradient_feathering` for
+soft blending or `hard_average` for direct averaging in overlapping regions.

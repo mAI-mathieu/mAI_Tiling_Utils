@@ -1,5 +1,166 @@
+from fractions import Fraction
+
 import torch
 import torch.nn.functional as F
+
+
+SCALE_TOLERANCE = 1e-6
+
+
+def _pad_for_tiling(image, pad_x, pad_y):
+    if pad_y == 0 and pad_x == 0:
+        return image
+
+    image_permuted = image.permute(0, 3, 1, 2)
+    height, width = image.shape[1], image.shape[2]
+    mode = "reflect"
+    if height <= 1 or width <= 1 or pad_y >= height or pad_x >= width:
+        mode = "replicate"
+
+    padded = F.pad(image_permuted, (0, pad_x, 0, pad_y), mode=mode)
+    return padded.permute(0, 2, 3, 1)
+
+
+def _require_int(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if int(value) != value:
+        raise ValueError(f"{name} must be an integer")
+    return int(value)
+
+
+def _scaled_int(value, scale, label):
+    scaled = Fraction(value) * scale
+    if scaled.denominator != 1:
+        raise ValueError(
+            f"Scale {float(scale):g} creates a non-integer {label}: "
+            f"{value} * {float(scale):g} = {float(scaled):g}"
+        )
+    return scaled.numerator
+
+
+def _manual_scale_fraction(manual_scale):
+    try:
+        scale = Fraction(str(float(manual_scale))).limit_denominator(1000000)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"manual_scale must be a positive number, got {manual_scale!r}") from exc
+
+    if scale <= 0:
+        raise ValueError(f"manual_scale must be positive, got {manual_scale!r}")
+    return scale
+
+
+def _validate_layout_coords(axis_name, coords, padded_size, tile_size):
+    if not isinstance(coords, (list, tuple)) or not coords:
+        raise ValueError(f"tile_layout {axis_name}_coords must be a non-empty list")
+
+    clean_coords = []
+    for index, coord in enumerate(coords):
+        coord = _require_int(coord, f"tile_layout {axis_name}_coords[{index}]")
+        if coord < 0 or coord + tile_size > padded_size:
+            raise ValueError(
+                f"tile_layout {axis_name}_coords[{index}]={coord} is outside the "
+                f"padded {axis_name} size {padded_size} for tile size {tile_size}"
+            )
+        if clean_coords:
+            step = coord - clean_coords[-1]
+            if step <= 0:
+                raise ValueError(
+                    f"Invalid tile layout overlap/coordinates: {axis_name}_coords "
+                    "must be strictly increasing"
+                )
+            if step > tile_size:
+                raise ValueError(
+                    f"Invalid tile layout overlap/coordinates: consecutive "
+                    f"{axis_name}_coords leave a gap larger than tile size {tile_size}"
+                )
+        clean_coords.append(coord)
+
+    expected_last = padded_size - tile_size
+    if clean_coords[0] != 0 or clean_coords[-1] != expected_last:
+        raise ValueError(
+            f"tile_layout {axis_name}_coords must cover the full padded {axis_name} "
+            f"range from 0 to {expected_last}"
+        )
+    return clean_coords
+
+
+def _resolve_scale(
+    tile_width,
+    tile_height,
+    processed_tile_width,
+    processed_tile_height,
+    scale_mode,
+    manual_scale,
+):
+    if processed_tile_width <= 0 or processed_tile_height <= 0:
+        raise ValueError(
+            f"Processed tile size must be positive, got "
+            f"{processed_tile_width}x{processed_tile_height}"
+        )
+
+    if scale_mode == "auto":
+        scale_x = Fraction(processed_tile_width, tile_width)
+        scale_y = Fraction(processed_tile_height, tile_height)
+        if abs(float(scale_x) - float(scale_y)) > SCALE_TOLERANCE:
+            raise ValueError(
+                "Processed tile size is not proportional to the original tile size: "
+                f"original {tile_width}x{tile_height}, processed "
+                f"{processed_tile_width}x{processed_tile_height}, "
+                f"scale_x={float(scale_x):g}, scale_y={float(scale_y):g}"
+            )
+        return scale_x
+
+    if scale_mode == "manual":
+        scale = _manual_scale_fraction(manual_scale)
+        expected_width = Fraction(tile_width) * scale
+        expected_height = Fraction(tile_height) * scale
+        if expected_width.denominator != 1 or expected_height.denominator != 1:
+            raise ValueError(
+                f"manual_scale {float(scale):g} creates a non-integer expected tile "
+                f"size from original {tile_width}x{tile_height}"
+            )
+
+        expected_width = expected_width.numerator
+        expected_height = expected_height.numerator
+        if (
+            processed_tile_width != expected_width
+            or processed_tile_height != expected_height
+        ):
+            raise ValueError(
+                f"manual_scale {float(scale):g} expects processed tile size "
+                f"{expected_width}x{expected_height} from original "
+                f"{tile_width}x{tile_height}, but received "
+                f"{processed_tile_width}x{processed_tile_height}"
+            )
+        return scale
+
+    raise ValueError(f"scale_mode must be 'auto' or 'manual', got {scale_mode!r}")
+
+
+def _gradient_mask(tile_height, tile_width, y, x, y_coords, x_coords, device):
+    mask_y = torch.ones((tile_height, 1), device=device)
+    mask_x = torch.ones((1, tile_width), device=device)
+
+    y_mid = tile_height // 2
+    x_mid = tile_width // 2
+
+    mask_y[:y_mid, 0] = torch.linspace(0, 1, y_mid, device=device)
+    mask_y[y_mid:, 0] = torch.linspace(1, 0, tile_height - y_mid, device=device)
+
+    mask_x[0, :x_mid] = torch.linspace(0, 1, x_mid, device=device)
+    mask_x[0, x_mid:] = torch.linspace(1, 0, tile_width - x_mid, device=device)
+
+    if y == y_coords[0]:
+        mask_y[:y_mid, 0] = 1.0
+    if y == y_coords[-1]:
+        mask_y[y_mid:, 0] = 1.0
+    if x == x_coords[0]:
+        mask_x[0, :x_mid] = 1.0
+    if x == x_coords[-1]:
+        mask_x[0, x_mid:] = 1.0
+
+    return (mask_y * mask_x).unsqueeze(0).unsqueeze(3)
 
 class mAI_ImageToTiles:
     @classmethod
@@ -21,6 +182,19 @@ class mAI_ImageToTiles:
 
     def split(self, image, tile_width, tile_height, overlap):
         B, H, W, C = image.shape
+
+        if tile_width <= 0 or tile_height <= 0:
+            raise ValueError(
+                f"tile_width and tile_height must be positive, got "
+                f"{tile_width}x{tile_height}"
+            )
+        if overlap < 0:
+            raise ValueError(f"overlap must be non-negative, got {overlap}")
+        if overlap >= tile_width or overlap >= tile_height:
+            raise ValueError(
+                f"overlap must be smaller than both tile dimensions, got overlap "
+                f"{overlap} for tile size {tile_width}x{tile_height}"
+            )
         
         # Ensure stride is at least 1 pixel
         stride_y = max(1, tile_height - overlap)
@@ -30,13 +204,7 @@ class mAI_ImageToTiles:
         pad_y = max(0, tile_height - H)
         pad_x = max(0, tile_width - W)
 
-        if pad_y > 0 or pad_x > 0:
-            # PyTorch padding expects (B, C, H, W)
-            image_permuted = image.permute(0, 3, 1, 2)
-            padded = F.pad(image_permuted, (0, pad_x, 0, pad_y), mode='reflect')
-            padded_image = padded.permute(0, 2, 3, 1)
-        else:
-            padded_image = image
+        padded_image = _pad_for_tiling(image, pad_x, pad_y)
 
         P_H, P_W = padded_image.shape[1], padded_image.shape[2]
 
@@ -66,6 +234,10 @@ class mAI_ImageToTiles:
             "B": B, "H": H, "W": W,
             "pad_y": pad_y, "pad_x": pad_x,
             "tile_width": tile_width, "tile_height": tile_height,
+            "original_tile_width": tile_width,
+            "original_tile_height": tile_height,
+            "expected_input_tile_width": tile_width,
+            "expected_input_tile_height": tile_height,
             "y_coords": y_coords, "x_coords": x_coords
         }
 
@@ -80,6 +252,8 @@ class mAI_TilesToImage:
                 "tiles": ("IMAGE",),
                 "tile_layout": ("mAI_TILE_LAYOUT",),
                 "blend_mode": (["gradient_feathering", "hard_average"],),
+                "scale_mode": (["auto", "manual"], {"default": "auto"}),
+                "manual_scale": ("FLOAT", {"default": 4.0, "min": 0.25, "max": 16.0, "step": 0.25}),
             }
         }
 
@@ -88,51 +262,97 @@ class mAI_TilesToImage:
     FUNCTION = "merge"
     CATEGORY = "mAI/tiling"
 
-    def merge(self, tiles, tile_layout, blend_mode):
+    def merge(self, tiles, tile_layout, blend_mode, scale_mode="auto", manual_scale=4.0):
+        if tiles.ndim != 4:
+            raise ValueError(
+                f"tiles must be a ComfyUI IMAGE tensor shaped "
+                f"[batch, height, width, channels], got shape {tuple(tiles.shape)}"
+            )
+
         # Read the blueprint
         B, H, W = tile_layout["B"], tile_layout["H"], tile_layout["W"]
         pad_y, pad_x = tile_layout["pad_y"], tile_layout["pad_x"]
         tile_width, tile_height = tile_layout["tile_width"], tile_layout["tile_height"]
         y_coords, x_coords = tile_layout["y_coords"], tile_layout["x_coords"]
 
+        B = _require_int(B, "tile_layout B")
+        H = _require_int(H, "tile_layout H")
+        W = _require_int(W, "tile_layout W")
+        pad_y = _require_int(pad_y, "tile_layout pad_y")
+        pad_x = _require_int(pad_x, "tile_layout pad_x")
+        tile_width = _require_int(tile_width, "tile_layout tile_width")
+        tile_height = _require_int(tile_height, "tile_layout tile_height")
+
+        if B <= 0 or H <= 0 or W <= 0:
+            raise ValueError(f"tile_layout B, H, and W must be positive, got {B}, {H}, {W}")
+        if pad_y < 0 or pad_x < 0:
+            raise ValueError(f"tile_layout padding must be non-negative, got {pad_x}x{pad_y}")
+        if tile_width <= 0 or tile_height <= 0:
+            raise ValueError(
+                f"tile_layout tile size must be positive, got {tile_width}x{tile_height}"
+            )
+
         P_H, P_W = H + pad_y, W + pad_x
+        y_coords = _validate_layout_coords("y", y_coords, P_H, tile_height)
+        x_coords = _validate_layout_coords("x", x_coords, P_W, tile_width)
+
+        expected_tile_count = B * len(y_coords) * len(x_coords)
+        actual_tile_count = tiles.shape[0]
+        if actual_tile_count != expected_tile_count:
+            raise ValueError(
+                f"Tile count mismatch: tile_layout expects {expected_tile_count} "
+                f"tiles ({B} batch x {len(y_coords)} rows x {len(x_coords)} cols), "
+                f"but tiles input contains {actual_tile_count}"
+            )
+
+        processed_tile_height = tiles.shape[1]
+        processed_tile_width = tiles.shape[2]
+        scale = _resolve_scale(
+            tile_width,
+            tile_height,
+            processed_tile_width,
+            processed_tile_height,
+            scale_mode,
+            manual_scale,
+        )
+
+        scaled_p_h = _scaled_int(P_H, scale, "padded image height")
+        scaled_p_w = _scaled_int(P_W, scale, "padded image width")
+        final_h = _scaled_int(H, scale, "final image height")
+        final_w = _scaled_int(W, scale, "final image width")
         C = tiles.shape[3]
 
         # Create empty canvases for the reconstructed image and the blending weights
-        reconstructed = torch.zeros((B, P_H, P_W, C), dtype=torch.float32, device=tiles.device)
-        weights = torch.zeros((B, P_H, P_W, 1), dtype=torch.float32, device=tiles.device)
+        reconstructed = torch.zeros((B, scaled_p_h, scaled_p_w, C), dtype=torch.float32, device=tiles.device)
+        weights = torch.zeros((B, scaled_p_h, scaled_p_w, 1), dtype=torch.float32, device=tiles.device)
 
         tile_idx = 0
         for b in range(B):
             for y in y_coords:
                 for x in x_coords:
                     tile = tiles[tile_idx:tile_idx+1]
+                    scaled_y = _scaled_int(y, scale, "tile y coordinate")
+                    scaled_x = _scaled_int(x, scale, "tile x coordinate")
 
                     # Gradient feathering ensures seams are blended softly instead of sharp lines
                     if blend_mode == "gradient_feathering":
-                        mask_y = torch.ones((tile_height, 1), device=tiles.device)
-                        mask_x = torch.ones((1, tile_width), device=tiles.device)
-
-                        # Create soft linear ramps for the edges
-                        mask_y[:tile_height//2, 0] = torch.linspace(0, 1, tile_height//2, device=tiles.device)
-                        mask_y[tile_height//2:, 0] = torch.linspace(1, 0, tile_height - tile_height//2, device=tiles.device)
-                        
-                        mask_x[0, :tile_width//2] = torch.linspace(0, 1, tile_width//2, device=tiles.device)
-                        mask_x[0, tile_width//2:] = torch.linspace(1, 0, tile_width - tile_width//2, device=tiles.device)
-
-                        # Do not fade the absolute outer edges of the whole image
-                        if y == y_coords[0]: mask_y[:tile_height//2, 0] = 1.0
-                        if y == y_coords[-1]: mask_y[tile_height//2:, 0] = 1.0
-                        if x == x_coords[0]: mask_x[0, :tile_width//2] = 1.0
-                        if x == x_coords[-1]: mask_x[0, tile_width//2:] = 1.0
-
-                        mask = (mask_y * mask_x).unsqueeze(0).unsqueeze(3)
+                        mask = _gradient_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            y,
+                            x,
+                            y_coords,
+                            x_coords,
+                            tiles.device,
+                        )
                     else:
-                        mask = torch.ones((1, tile_height, tile_width, 1), device=tiles.device)
+                        mask = torch.ones((1, processed_tile_height, processed_tile_width, 1), device=tiles.device)
 
                     # Add the tile to the canvas and add its mask to the weight tracker
-                    reconstructed[b:b+1, y:y+tile_height, x:x+tile_width, :] += tile * mask
-                    weights[b:b+1, y:y+tile_height, x:x+tile_width, :] += mask
+                    y_end = scaled_y + processed_tile_height
+                    x_end = scaled_x + processed_tile_width
+                    reconstructed[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += tile * mask
+                    weights[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += mask
                     tile_idx += 1
 
         # Normalize the canvas by dividing the pixels by the weight map (this guarantees 100% perfect math)
@@ -140,7 +360,7 @@ class mAI_TilesToImage:
         reconstructed /= weights
 
         # Crop out any padding that was added at the start to perfectly match the original input
-        final_image = reconstructed[:, :H, :W, :]
+        final_image = reconstructed[:, :final_h, :final_w, :]
         final_image = torch.clamp(final_image, 0.0, 1.0)
         
         return (final_image,)
