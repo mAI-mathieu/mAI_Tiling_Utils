@@ -1,3 +1,4 @@
+import math
 from fractions import Fraction
 
 import torch
@@ -36,6 +37,282 @@ def _tile_count(image_size, tile_size, overlap):
 
     stride = tile_size - overlap
     return (image_size - tile_size + stride - 1) // stride + 1
+
+
+def _axis_overlap(starts, index, tile_size, side):
+    start = starts[index]
+    end = start + tile_size
+
+    if side == "left":
+        if index == 0:
+            return 0
+        return max(0, min(tile_size, starts[index - 1] + tile_size - start))
+
+    if index == len(starts) - 1:
+        return 0
+    return max(0, min(tile_size, end - starts[index + 1]))
+
+
+def _feather_ramp(length, curve, device):
+    if length <= 0:
+        return None
+
+    progress = torch.linspace(0.0, 1.0, length, device=device)
+    if curve == "cosine":
+        return 0.5 - 0.5 * torch.cos(progress * math.pi)
+    return progress
+
+
+def _overlap_feather_mask(
+    tile_height,
+    tile_width,
+    scaled_y_coords,
+    scaled_x_coords,
+    row_index,
+    col_index,
+    curve,
+    device,
+):
+    y_weights = torch.ones((tile_height,), device=device)
+    x_weights = torch.ones((tile_width,), device=device)
+
+    left_overlap = _axis_overlap(
+        scaled_x_coords, col_index, tile_width, "left"
+    )
+    right_overlap = _axis_overlap(
+        scaled_x_coords, col_index, tile_width, "right"
+    )
+    top_overlap = _axis_overlap(
+        scaled_y_coords, row_index, tile_height, "left"
+    )
+    bottom_overlap = _axis_overlap(
+        scaled_y_coords, row_index, tile_height, "right"
+    )
+
+    left_ramp = _feather_ramp(left_overlap, curve, device)
+    right_ramp = _feather_ramp(right_overlap, curve, device)
+    top_ramp = _feather_ramp(top_overlap, curve, device)
+    bottom_ramp = _feather_ramp(bottom_overlap, curve, device)
+
+    if left_ramp is not None:
+        x_weights[:left_overlap] *= left_ramp
+    if right_ramp is not None:
+        x_weights[-right_overlap:] *= torch.flip(right_ramp, dims=(0,))
+    if top_ramp is not None:
+        y_weights[:top_overlap] *= top_ramp
+    if bottom_ramp is not None:
+        y_weights[-bottom_overlap:] *= torch.flip(bottom_ramp, dims=(0,))
+
+    return (y_weights[:, None] * x_weights[None, :]).unsqueeze(0).unsqueeze(3)
+
+
+def _center_cut_axis_bounds(starts, index, tile_size, canvas_size):
+    start = starts[index]
+    end = start + tile_size
+    left = 0 if index == 0 else (starts[index - 1] + tile_size + start) // 2
+    right = canvas_size if index == len(starts) - 1 else (end + starts[index + 1]) // 2
+    return max(0, left - start), min(tile_size, right - start)
+
+
+def _center_cut_mask(
+    tile_height,
+    tile_width,
+    scaled_y_coords,
+    scaled_x_coords,
+    row_index,
+    col_index,
+    scaled_canvas_height,
+    scaled_canvas_width,
+    device,
+):
+    y_start, y_end = _center_cut_axis_bounds(
+        scaled_y_coords, row_index, tile_height, scaled_canvas_height
+    )
+    x_start, x_end = _center_cut_axis_bounds(
+        scaled_x_coords, col_index, tile_width, scaled_canvas_width
+    )
+    mask = torch.zeros(
+        (1, tile_height, tile_width, 1), device=device, dtype=torch.float32
+    )
+    mask[:, y_start:y_end, x_start:x_end, :] = 1.0
+    return mask
+
+
+def _find_content_seam(cost):
+    """Find a low-cost path through a [path_length, overlap_width] cost map."""
+    path_length, overlap_width = cost.shape
+    if overlap_width == 0:
+        return torch.zeros((path_length,), device=cost.device, dtype=torch.long)
+
+    cost = cost.to(dtype=torch.float32)
+    positions = torch.arange(overlap_width, device=cost.device, dtype=torch.float32)
+    center = (overlap_width - 1) / 2.0
+    cost = cost + torch.abs(positions - center).unsqueeze(0) * 1e-6
+
+    accumulated = cost[0]
+    backtrack = torch.zeros(
+        (path_length, overlap_width), device=cost.device, dtype=torch.long
+    )
+    positions_long = torch.arange(overlap_width, device=cost.device)
+
+    for row in range(1, path_length):
+        candidates = torch.full(
+            (3, overlap_width),
+            float("inf"),
+            device=cost.device,
+            dtype=accumulated.dtype,
+        )
+        candidates[0, 1:] = accumulated[:-1]
+        candidates[1] = accumulated
+        candidates[2, :-1] = accumulated[1:]
+        best_cost, choice = torch.min(candidates, dim=0)
+        accumulated = cost[row] + best_cost
+        backtrack[row] = positions_long + choice - 1
+
+    seam = torch.empty((path_length,), device=cost.device, dtype=torch.long)
+    seam[-1] = torch.argmin(accumulated)
+    for row in range(path_length - 1, 0, -1):
+        seam[row - 1] = backtrack[row, seam[row]]
+    return seam
+
+
+def _content_aware_masks(
+    tiles,
+    batch_size,
+    scaled_y_coords,
+    scaled_x_coords,
+    tile_height,
+    tile_width,
+    device,
+):
+    """Build non-overlapping masks using low-difference seams between tiles."""
+    rows = len(scaled_y_coords)
+    columns = len(scaled_x_coords)
+    total_tiles = batch_size * rows * columns
+    x_masks = [
+        torch.ones((tile_height, tile_width), device=device, dtype=torch.float32)
+        for _ in range(total_tiles)
+    ]
+    y_masks = [
+        torch.ones((tile_height, tile_width), device=device, dtype=torch.float32)
+        for _ in range(total_tiles)
+    ]
+
+    def tile_index(batch_index, row_index, column_index):
+        return (batch_index * rows + row_index) * columns + column_index
+
+    for batch_index in range(batch_size):
+        for row_index in range(rows):
+            for column_index in range(columns - 1):
+                left_index = tile_index(batch_index, row_index, column_index)
+                right_index = tile_index(batch_index, row_index, column_index + 1)
+                overlap = max(
+                    0,
+                    min(
+                        tile_width,
+                        scaled_x_coords[column_index] + tile_width
+                        - scaled_x_coords[column_index + 1],
+                    ),
+                )
+                if overlap == 0:
+                    continue
+
+                difference = (
+                    tiles[left_index : left_index + 1, :, -overlap:, :]
+                    - tiles[right_index : right_index + 1, :, :overlap, :]
+                ).abs()
+                cost = difference.mean(dim=(0, 3))
+                seam = _find_content_seam(cost)
+                selection = (
+                    torch.arange(overlap, device=device).unsqueeze(0)
+                    < seam.unsqueeze(1)
+                )
+
+                y_start, y_end = _center_cut_axis_bounds(
+                    scaled_y_coords,
+                    row_index,
+                    tile_height,
+                    scaled_y_coords[-1] + tile_height,
+                )
+                left_mask = x_masks[left_index]
+                right_mask = x_masks[right_index]
+                left_mask[y_start:y_end, -overlap:] = selection[y_start:y_end]
+                right_mask[y_start:y_end, :overlap] = ~selection[y_start:y_end]
+
+        for row_index in range(rows - 1):
+            for column_index in range(columns):
+                top_index = tile_index(batch_index, row_index, column_index)
+                bottom_index = tile_index(batch_index, row_index + 1, column_index)
+                overlap = max(
+                    0,
+                    min(
+                        tile_height,
+                        scaled_y_coords[row_index] + tile_height
+                        - scaled_y_coords[row_index + 1],
+                    ),
+                )
+                if overlap == 0:
+                    continue
+
+                difference = (
+                    tiles[top_index : top_index + 1, -overlap:, :, :]
+                    - tiles[bottom_index : bottom_index + 1, :overlap, :, :]
+                ).abs()
+                cost = difference.mean(dim=(0, 3)).transpose(0, 1)
+                seam = _find_content_seam(cost)
+                selection = (
+                    torch.arange(overlap, device=device).unsqueeze(0)
+                    < seam.unsqueeze(1)
+                )
+
+                x_start, x_end = _center_cut_axis_bounds(
+                    scaled_x_coords,
+                    column_index,
+                    tile_width,
+                    scaled_x_coords[-1] + tile_width,
+                )
+                top_mask = y_masks[top_index]
+                bottom_mask = y_masks[bottom_index]
+                top_mask[-overlap:, x_start:x_end] = selection.transpose(0, 1)[:, x_start:x_end]
+                bottom_mask[:overlap, x_start:x_end] = (~selection).transpose(0, 1)[:, x_start:x_end]
+
+    masks = []
+    for x_mask, y_mask in zip(x_masks, y_masks):
+        masks.append((x_mask * y_mask).unsqueeze(0).unsqueeze(3))
+    return masks
+
+
+def _gaussian_blur(image, sigma):
+    if sigma <= 0:
+        return image
+
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    coordinates = torch.arange(
+        -radius, radius + 1, device=image.device, dtype=image.dtype
+    )
+    kernel_1d = torch.exp(-(coordinates**2) / (2.0 * sigma**2))
+    kernel_1d /= kernel_1d.sum()
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+
+    channels = image.shape[3]
+    image_nchw = image.permute(0, 3, 1, 2)
+    padding_mode = "reflect"
+    if image.shape[1] <= radius or image.shape[2] <= radius:
+        padding_mode = "replicate"
+    padded = F.pad(image_nchw, (radius, radius, radius, radius), mode=padding_mode)
+    kernel = kernel_2d.view(1, 1, kernel_2d.shape[0], kernel_2d.shape[1])
+    kernel = kernel.expand(channels, 1, -1, -1)
+    blurred = F.conv2d(padded, kernel, groups=channels)
+    return blurred.permute(0, 2, 3, 1)
+
+
+def _multiband_recombine(blended, sharp, max_overlap):
+    # Keep low frequencies from the feathered composite and high frequencies
+    # from the seam-selected composite to avoid averaging generated details.
+    sigma = max(1.0, min(8.0, max_overlap / 16.0))
+    blended_low = _gaussian_blur(blended, sigma)
+    sharp_low = _gaussian_blur(sharp, sigma)
+    return blended_low + (sharp - sharp_low)
 
 
 def _round_up_to_divisor(value, divisor):
@@ -324,7 +601,18 @@ class mAI_TilesToImage:
             "required": {
                 "tiles": ("IMAGE",),
                 "tile_layout": ("mAI_TILE_LAYOUT",),
-                "blend_mode": (["gradient_feathering", "hard_average", "none"],),
+                "blend_mode": (
+                    [
+                        "gradient_feathering",
+                        "overlap_feather",
+                        "cosine_feather",
+                        "center_cut",
+                        "multiband",
+                        "content_aware_seam",
+                        "hard_average",
+                        "none",
+                    ],
+                ),
                 "scale_mode": (["auto", "manual"], {"default": "auto"}),
                 "manual_scale": ("FLOAT", {"default": 4.0, "min": 0.25, "max": 16.0, "step": 0.25}),
             }
@@ -394,18 +682,73 @@ class mAI_TilesToImage:
         final_h = _scaled_int(H, scale, "final image height")
         final_w = _scaled_int(W, scale, "final image width")
         C = tiles.shape[3]
+        scaled_y_coords = [
+            _scaled_int(y, scale, "tile y coordinate") for y in y_coords
+        ]
+        scaled_x_coords = [
+            _scaled_int(x, scale, "tile x coordinate") for x in x_coords
+        ]
+
+        valid_blend_modes = {
+            "gradient_feathering",
+            "overlap_feather",
+            "cosine_feather",
+            "center_cut",
+            "multiband",
+            "content_aware_seam",
+            "hard_average",
+            "none",
+        }
+        if blend_mode not in valid_blend_modes:
+            raise ValueError(
+                f"blend_mode must be one of {sorted(valid_blend_modes)}, "
+                f"got {blend_mode!r}"
+            )
+
+        content_masks = None
+        if blend_mode == "content_aware_seam":
+            content_masks = _content_aware_masks(
+                tiles,
+                B,
+                scaled_y_coords,
+                scaled_x_coords,
+                processed_tile_height,
+                processed_tile_width,
+                tiles.device,
+            )
+
+        max_processed_overlap = max(
+            [
+                _axis_overlap(
+                    scaled_x_coords, index, processed_tile_width, "right"
+                )
+                for index in range(len(scaled_x_coords))
+            ]
+            + [
+                _axis_overlap(
+                    scaled_y_coords, index, processed_tile_height, "right"
+                )
+                for index in range(len(scaled_y_coords))
+            ]
+            + [0]
+        )
 
         # Create empty canvases for the reconstructed image and the blending weights
         reconstructed = torch.zeros((B, scaled_p_h, scaled_p_w, C), dtype=torch.float32, device=tiles.device)
         weights = torch.zeros((B, scaled_p_h, scaled_p_w, 1), dtype=torch.float32, device=tiles.device)
+        sharp_reconstructed = None
+        sharp_weights = None
+        if blend_mode == "multiband":
+            sharp_reconstructed = torch.zeros_like(reconstructed)
+            sharp_weights = torch.zeros_like(weights)
 
         tile_idx = 0
         for b in range(B):
-            for y in y_coords:
-                for x in x_coords:
+            for row_index, y in enumerate(y_coords):
+                for col_index, x in enumerate(x_coords):
                     tile = tiles[tile_idx:tile_idx+1]
-                    scaled_y = _scaled_int(y, scale, "tile y coordinate")
-                    scaled_x = _scaled_int(x, scale, "tile x coordinate")
+                    scaled_y = scaled_y_coords[row_index]
+                    scaled_x = scaled_x_coords[col_index]
 
                     # Gradient feathering ensures seams are blended softly instead of sharp lines
                     if blend_mode == "gradient_feathering":
@@ -418,6 +761,53 @@ class mAI_TilesToImage:
                             x_coords,
                             tiles.device,
                         )
+                    elif blend_mode == "overlap_feather":
+                        mask = _overlap_feather_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            scaled_y_coords,
+                            scaled_x_coords,
+                            row_index,
+                            col_index,
+                            "linear",
+                            tiles.device,
+                        )
+                    elif blend_mode == "cosine_feather":
+                        mask = _overlap_feather_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            scaled_y_coords,
+                            scaled_x_coords,
+                            row_index,
+                            col_index,
+                            "cosine",
+                            tiles.device,
+                        )
+                    elif blend_mode == "center_cut":
+                        mask = _center_cut_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            scaled_y_coords,
+                            scaled_x_coords,
+                            row_index,
+                            col_index,
+                            scaled_p_h,
+                            scaled_p_w,
+                            tiles.device,
+                        )
+                    elif blend_mode == "content_aware_seam":
+                        mask = content_masks[tile_idx]
+                    elif blend_mode == "multiband":
+                        mask = _overlap_feather_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            scaled_y_coords,
+                            scaled_x_coords,
+                            row_index,
+                            col_index,
+                            "cosine",
+                            tiles.device,
+                        )
                     elif blend_mode == "hard_average":
                         mask = torch.ones((1, processed_tile_height, processed_tile_width, 1), device=tiles.device)
                     elif blend_mode == "none":
@@ -428,21 +818,38 @@ class mAI_TilesToImage:
                         reconstructed[b:b+1, scaled_y:y_end, scaled_x:x_end, :] = tile
                         tile_idx += 1
                         continue
-                    else:
-                        raise ValueError(
-                            "blend_mode must be 'gradient_feathering', "
-                            f"'hard_average', or 'none', got {blend_mode!r}"
-                        )
 
                     # Add the tile to the canvas and add its mask to the weight tracker
                     y_end = scaled_y + processed_tile_height
                     x_end = scaled_x + processed_tile_width
                     reconstructed[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += tile * mask
                     weights[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += mask
+                    if blend_mode == "multiband":
+                        sharp_mask = _center_cut_mask(
+                            processed_tile_height,
+                            processed_tile_width,
+                            scaled_y_coords,
+                            scaled_x_coords,
+                            row_index,
+                            col_index,
+                            scaled_p_h,
+                            scaled_p_w,
+                            tiles.device,
+                        )
+                        sharp_reconstructed[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += tile * sharp_mask
+                        sharp_weights[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += sharp_mask
                     tile_idx += 1
 
         # Normalize blended modes by dividing the pixels by the weight map.
-        if blend_mode != "none":
+        if blend_mode == "multiband":
+            weights = torch.clamp(weights, min=1e-8)
+            sharp_weights = torch.clamp(sharp_weights, min=1e-8)
+            blended = reconstructed / weights
+            sharp = sharp_reconstructed / sharp_weights
+            reconstructed = _multiband_recombine(
+                blended, sharp, max_processed_overlap
+            )
+        elif blend_mode != "none":
             weights = torch.clamp(weights, min=1e-8)
             reconstructed /= weights
 

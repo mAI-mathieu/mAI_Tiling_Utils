@@ -126,6 +126,28 @@ class TestMAITiling(unittest.TestCase):
         self.assertTrue(torch.all(result[:, :, :64, :] == 0.0))
         self.assertTrue(torch.all(result[:, :, 64:, :] == 1.0))
 
+    def test_new_blend_modes_return_finite_images(self):
+        image = torch.zeros((1, 128, 192, 1), dtype=torch.float32)
+        tiles, layout = _split(
+            image,
+            tile_width=128,
+            tile_height=128,
+            overlap=64,
+            tile_divisor=8,
+        )
+
+        for blend_mode in (
+            "overlap_feather",
+            "cosine_feather",
+            "center_cut",
+            "multiband",
+            "content_aware_seam",
+        ):
+            with self.subTest(blend_mode=blend_mode):
+                result = mAI_TilesToImage().merge(tiles, layout, blend_mode)[0]
+                self.assertEqual(result.shape, image.shape)
+                self.assertTrue(torch.isfinite(result).all())
+
     def test_512_tiles_stitch_after_fake_4x_upscale_auto(self):
         image = torch.zeros((1, 512, 512, 1), dtype=torch.float32)
         tiles, layout = _split(image)

@@ -39,7 +39,7 @@ tile_height: 512
 overlap: 64 or 128
 tile_divisor: 8
 minimize_tiles: false
-blend_mode: gradient_feathering
+blend_mode: overlap_feather
 scale_mode: auto
 ```
 
@@ -73,7 +73,15 @@ The scaled output dimensions must be exact integers. If the tile scale would
 produce fractional canvas, crop, or tile-coordinate sizes, the stitcher raises a
 clear error instead of guessing.
 
-Overlap is strongly recommended to reduce seams. Use `gradient_feathering` for
-soft blending, `hard_average` for direct averaging, or `none` to disable
-blending. With `none`, overlapping pixels are overwritten by the later tile in
-the layout order.
+Overlap is strongly recommended to reduce seams. Available blend modes are:
+
+- `overlap_feather`: linear blending only across the actual overlap area.
+- `cosine_feather`: smoother cosine blending across the actual overlap area.
+- `center_cut`: sharp center seams with no averaging.
+- `multiband`: blends low-frequency transitions while preserving sharp details.
+- `content_aware_seam`: selects low-difference seams between neighboring tiles.
+- `hard_average`: averages all overlapping pixels.
+- `none`: disables blending; later tiles overwrite earlier tiles in overlaps.
+
+`gradient_feathering` remains available for compatibility with existing
+workflows.
