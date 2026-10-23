@@ -29,6 +29,66 @@ def _require_int(value, name):
     return int(value)
 
 
+def _tile_count(image_size, tile_size, overlap):
+    if image_size <= tile_size:
+        return 1
+
+    stride = tile_size - overlap
+    return (image_size - tile_size + stride - 1) // stride + 1
+
+
+def _tile_size_candidates(requested_size, overlap, divisor):
+    lower_bound = max(1, overlap + 1, requested_size - overlap)
+    upper_bound = requested_size + overlap
+    first_candidate = ((lower_bound + divisor - 1) // divisor) * divisor
+
+    if first_candidate <= upper_bound:
+        return range(first_candidate, upper_bound + 1, divisor)
+
+    # A divisor larger than the requested search window still needs a valid
+    # candidate. In that case, use the first divisible size at or above the
+    # requested size and overlap.
+    fallback = max(requested_size, overlap + 1)
+    fallback = ((fallback + divisor - 1) // divisor) * divisor
+    return (fallback,)
+
+
+def _resolve_tile_size(image_size, requested_size, overlap, divisor, minimize, axis_name):
+    requested_size = _require_int(requested_size, f"tile_{axis_name}")
+    overlap = _require_int(overlap, "overlap")
+    divisor = _require_int(divisor, "tile_divisor")
+
+    if requested_size <= 0:
+        raise ValueError(f"tile_{axis_name} must be positive, got {requested_size}")
+    if overlap < 0:
+        raise ValueError(f"overlap must be non-negative, got {overlap}")
+    if divisor <= 0:
+        raise ValueError(f"tile_divisor must be positive, got {divisor}")
+
+    if not minimize:
+        if requested_size % divisor != 0:
+            raise ValueError(
+                f"tile_{axis_name}={requested_size} must be divisible by "
+                f"tile_divisor={divisor}"
+            )
+        if overlap >= requested_size:
+            raise ValueError(
+                f"overlap must be smaller than tile_{axis_name}={requested_size}, "
+                f"got {overlap}"
+            )
+        return requested_size
+
+    candidates = _tile_size_candidates(requested_size, overlap, divisor)
+    return min(
+        candidates,
+        key=lambda size: (
+            _tile_count(image_size, size, overlap),
+            abs(size - requested_size),
+            size,
+        ),
+    )
+
+
 def _scaled_int(value, scale, label):
     scaled = Fraction(value) * scale
     if scaled.denominator != 1:
@@ -171,6 +231,8 @@ class mAI_ImageToTiles:
                 "tile_width": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 64}),
                 "tile_height": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 64}),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8}),
+                "tile_divisor": ("INT", {"default": 8, "min": 1, "max": 8192, "step": 1}),
+                "minimize_tiles": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -180,21 +242,27 @@ class mAI_ImageToTiles:
     FUNCTION = "split"
     CATEGORY = "mAI/tiling"
 
-    def split(self, image, tile_width, tile_height, overlap):
+    def split(
+        self,
+        image,
+        tile_width,
+        tile_height,
+        overlap,
+        tile_divisor=8,
+        minimize_tiles=False,
+    ):
         B, H, W, C = image.shape
 
-        if tile_width <= 0 or tile_height <= 0:
-            raise ValueError(
-                f"tile_width and tile_height must be positive, got "
-                f"{tile_width}x{tile_height}"
-            )
-        if overlap < 0:
-            raise ValueError(f"overlap must be non-negative, got {overlap}")
-        if overlap >= tile_width or overlap >= tile_height:
-            raise ValueError(
-                f"overlap must be smaller than both tile dimensions, got overlap "
-                f"{overlap} for tile size {tile_width}x{tile_height}"
-            )
+        requested_tile_width = _require_int(tile_width, "tile_width")
+        requested_tile_height = _require_int(tile_height, "tile_height")
+        overlap = _require_int(overlap, "overlap")
+        tile_divisor = _require_int(tile_divisor, "tile_divisor")
+        tile_width = _resolve_tile_size(
+            W, requested_tile_width, overlap, tile_divisor, minimize_tiles, "width"
+        )
+        tile_height = _resolve_tile_size(
+            H, requested_tile_height, overlap, tile_divisor, minimize_tiles, "height"
+        )
         
         # Ensure stride is at least 1 pixel
         stride_y = max(1, tile_height - overlap)
@@ -234,6 +302,10 @@ class mAI_ImageToTiles:
             "B": B, "H": H, "W": W,
             "pad_y": pad_y, "pad_x": pad_x,
             "tile_width": tile_width, "tile_height": tile_height,
+            "requested_tile_width": requested_tile_width,
+            "requested_tile_height": requested_tile_height,
+            "tile_divisor": tile_divisor,
+            "minimize_tiles": bool(minimize_tiles),
             "original_tile_width": tile_width,
             "original_tile_height": tile_height,
             "expected_input_tile_width": tile_width,

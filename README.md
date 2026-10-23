@@ -37,9 +37,23 @@ Recommended settings:
 tile_width: 512
 tile_height: 512
 overlap: 64 or 128
+tile_divisor: 8
+minimize_tiles: false
 blend_mode: gradient_feathering
 scale_mode: auto
 ```
+
+`tile_divisor` requires the effective tile width and height to be divisible by
+the selected number. For example, with `tile_divisor: 8`, a tile size of
+`512x512` is valid, while `510x512` is rejected.
+
+When `minimize_tiles` is enabled, the node adjusts each tile dimension in a
+bounded range around the requested size (up to one overlap width in either
+direction). It chooses divisible dimensions that minimize the number of tile
+rows and columns, while preferring dimensions closest to the requested values.
+If no divisible size exists in that range, it rounds up to the next valid
+divisible size. The selected dimensions are stored in `tile_layout` and used
+automatically by the stitcher.
 
 The stitcher reads the original tile size from `tile_layout` and the processed
 tile size from the incoming `tiles` tensor. In `auto` mode it detects the scale

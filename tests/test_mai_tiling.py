@@ -5,8 +5,22 @@ import torch
 from mai_tiling import mAI_ImageToTiles, mAI_TilesToImage
 
 
-def _split(image, tile_width=512, tile_height=512, overlap=64):
-    return mAI_ImageToTiles().split(image, tile_width, tile_height, overlap)
+def _split(
+    image,
+    tile_width=512,
+    tile_height=512,
+    overlap=64,
+    tile_divisor=8,
+    minimize_tiles=False,
+):
+    return mAI_ImageToTiles().split(
+        image,
+        tile_width,
+        tile_height,
+        overlap,
+        tile_divisor,
+        minimize_tiles,
+    )
 
 
 def _fake_scaled_tiles(tiles, scale, fill_value=0.0):
@@ -24,6 +38,45 @@ def _fake_scaled_tiles(tiles, scale, fill_value=0.0):
 
 
 class TestMAITiling(unittest.TestCase):
+    def test_tile_dimensions_must_be_divisible_by_tile_divisor(self):
+        image = torch.zeros((1, 768, 768, 1), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "tile_width=500.*tile_divisor=64"):
+            _split(image, tile_width=500, tile_height=512, tile_divisor=64)
+
+    def test_minimize_tiles_adjusts_dimensions_to_reduce_tile_count(self):
+        image = torch.zeros((1, 1536, 1536, 1), dtype=torch.float32)
+
+        tiles, layout = _split(
+            image,
+            tile_width=512,
+            tile_height=512,
+            overlap=64,
+            tile_divisor=64,
+            minimize_tiles=True,
+        )
+
+        self.assertEqual(layout["tile_width"], 576)
+        self.assertEqual(layout["tile_height"], 576)
+        self.assertEqual(layout["x_coords"], [0, 512, 960])
+        self.assertEqual(layout["y_coords"], [0, 512, 960])
+        self.assertEqual(tiles.shape, (9, 576, 576, 1))
+
+    def test_minimize_tiles_optimizes_each_axis_independently(self):
+        image = torch.zeros((1, 768, 1536, 1), dtype=torch.float32)
+
+        _, layout = _split(
+            image,
+            tile_width=512,
+            tile_height=512,
+            overlap=64,
+            tile_divisor=64,
+            minimize_tiles=True,
+        )
+
+        self.assertEqual(layout["tile_width"], 576)
+        self.assertEqual(layout["tile_height"], 512)
+
     def test_512_tile_stitches_at_1x(self):
         image = torch.linspace(0.0, 1.0, 512 * 512, dtype=torch.float32).reshape(
             1, 512, 512, 1
