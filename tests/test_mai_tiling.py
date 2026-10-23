@@ -38,11 +38,16 @@ def _fake_scaled_tiles(tiles, scale, fill_value=0.0):
 
 
 class TestMAITiling(unittest.TestCase):
-    def test_tile_dimensions_must_be_divisible_by_tile_divisor(self):
+    def test_tile_dimensions_are_rounded_up_to_tile_divisor(self):
         image = torch.zeros((1, 768, 768, 1), dtype=torch.float32)
 
-        with self.assertRaisesRegex(ValueError, "tile_width=500.*tile_divisor=64"):
-            _split(image, tile_width=500, tile_height=512, tile_divisor=64)
+        tiles, layout = _split(
+            image, tile_width=500, tile_height=512, tile_divisor=64
+        )
+
+        self.assertEqual(layout["tile_width"], 512)
+        self.assertEqual(layout["tile_height"], 512)
+        self.assertEqual(tiles.shape[1:3], (512, 512))
 
     def test_minimize_tiles_adjusts_dimensions_to_reduce_tile_count(self):
         image = torch.zeros((1, 1536, 1536, 1), dtype=torch.float32)
@@ -61,6 +66,21 @@ class TestMAITiling(unittest.TestCase):
         self.assertEqual(layout["x_coords"], [0, 512, 960])
         self.assertEqual(layout["y_coords"], [0, 512, 960])
         self.assertEqual(tiles.shape, (9, 576, 576, 1))
+
+    def test_minimize_tiles_can_adjust_up_to_a_quarter_of_request(self):
+        image = torch.zeros((1, 3200, 3200, 1), dtype=torch.float32)
+
+        _, layout = _split(
+            image,
+            tile_width=512,
+            tile_height=512,
+            overlap=64,
+            tile_divisor=64,
+            minimize_tiles=True,
+        )
+
+        self.assertEqual(layout["tile_width"], 640)
+        self.assertEqual(layout["tile_height"], 640)
 
     def test_minimize_tiles_optimizes_each_axis_independently(self):
         image = torch.zeros((1, 768, 1536, 1), dtype=torch.float32)

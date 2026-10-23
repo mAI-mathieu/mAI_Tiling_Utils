@@ -43,16 +43,16 @@ blend_mode: gradient_feathering
 scale_mode: auto
 ```
 
-`tile_divisor` requires the effective tile width and height to be divisible by
-the selected number. For example, with `tile_divisor: 8`, a tile size of
-`512x512` is valid, while `510x512` is rejected.
+`tile_divisor` makes the effective tile width and height divisible by the
+selected number. If the requested size is not divisible, it is rounded up to
+the next valid size. For example, with `tile_divisor: 16`, a requested tile
+size of `3000x3000` becomes `3008x3008`.
 
 When `minimize_tiles` is enabled, the node adjusts each tile dimension in a
-bounded range around the requested size (up to one overlap width in either
-direction). It chooses divisible dimensions that minimize the number of tile
-rows and columns, while preferring dimensions closest to the requested values.
-If no divisible size exists in that range, it rounds up to the next valid
-divisible size. The selected dimensions are stored in `tile_layout` and used
+bounded range of up to 25% below or above the requested size. Width and height
+are optimized independently. It chooses divisible dimensions that minimize the
+number of tile columns and rows, while preferring dimensions closest to the
+requested values. The selected dimensions are stored in `tile_layout` and used
 automatically by the stitcher.
 
 The stitcher reads the original tile size from `tile_layout` and the processed

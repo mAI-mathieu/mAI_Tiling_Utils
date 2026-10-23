@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 
 SCALE_TOLERANCE = 1e-6
+TILE_SIZE_ADJUSTMENT_FRACTION = 0.25
 
 
 def _pad_for_tiling(image, pad_x, pad_y):
@@ -37,10 +38,18 @@ def _tile_count(image_size, tile_size, overlap):
     return (image_size - tile_size + stride - 1) // stride + 1
 
 
+def _round_up_to_divisor(value, divisor):
+    return ((value + divisor - 1) // divisor) * divisor
+
+
 def _tile_size_candidates(requested_size, overlap, divisor):
-    lower_bound = max(1, overlap + 1, requested_size - overlap)
-    upper_bound = requested_size + overlap
-    first_candidate = ((lower_bound + divisor - 1) // divisor) * divisor
+    lower_bound = max(
+        1,
+        overlap + 1,
+        int(requested_size * (1 - TILE_SIZE_ADJUSTMENT_FRACTION)),
+    )
+    upper_bound = int(requested_size * (1 + TILE_SIZE_ADJUSTMENT_FRACTION))
+    first_candidate = _round_up_to_divisor(lower_bound, divisor)
 
     if first_candidate <= upper_bound:
         return range(first_candidate, upper_bound + 1, divisor)
@@ -49,7 +58,7 @@ def _tile_size_candidates(requested_size, overlap, divisor):
     # candidate. In that case, use the first divisible size at or above the
     # requested size and overlap.
     fallback = max(requested_size, overlap + 1)
-    fallback = ((fallback + divisor - 1) // divisor) * divisor
+    fallback = _round_up_to_divisor(fallback, divisor)
     return (fallback,)
 
 
@@ -66,17 +75,9 @@ def _resolve_tile_size(image_size, requested_size, overlap, divisor, minimize, a
         raise ValueError(f"tile_divisor must be positive, got {divisor}")
 
     if not minimize:
-        if requested_size % divisor != 0:
-            raise ValueError(
-                f"tile_{axis_name}={requested_size} must be divisible by "
-                f"tile_divisor={divisor}"
-            )
-        if overlap >= requested_size:
-            raise ValueError(
-                f"overlap must be smaller than tile_{axis_name}={requested_size}, "
-                f"got {overlap}"
-            )
-        return requested_size
+        # Preserve at least the requested capacity while making the tile size
+        # valid for the selected model/latent divisor.
+        return _round_up_to_divisor(max(requested_size, overlap + 1), divisor)
 
     candidates = _tile_size_candidates(requested_size, overlap, divisor)
     return min(
