@@ -108,6 +108,24 @@ class TestMAITiling(unittest.TestCase):
         self.assertEqual(result.shape, image.shape)
         torch.testing.assert_close(result, image, rtol=0, atol=0)
 
+    def test_none_blend_mode_overwrites_overlapping_tiles(self):
+        image = torch.zeros((1, 128, 192, 1), dtype=torch.float32)
+        tiles, layout = _split(
+            image,
+            tile_width=128,
+            tile_height=128,
+            overlap=64,
+            tile_divisor=8,
+        )
+        processed_tiles = torch.cat(
+            [torch.zeros_like(tiles[:1]), torch.ones_like(tiles[1:2])], dim=0
+        )
+
+        result = mAI_TilesToImage().merge(processed_tiles, layout, "none")[0]
+
+        self.assertTrue(torch.all(result[:, :, :64, :] == 0.0))
+        self.assertTrue(torch.all(result[:, :, 64:, :] == 1.0))
+
     def test_512_tiles_stitch_after_fake_4x_upscale_auto(self):
         image = torch.zeros((1, 512, 512, 1), dtype=torch.float32)
         tiles, layout = _split(image)

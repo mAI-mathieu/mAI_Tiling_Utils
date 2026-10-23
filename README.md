@@ -74,4 +74,6 @@ produce fractional canvas, crop, or tile-coordinate sizes, the stitcher raises a
 clear error instead of guessing.
 
 Overlap is strongly recommended to reduce seams. Use `gradient_feathering` for
-soft blending or `hard_average` for direct averaging in overlapping regions.
+soft blending, `hard_average` for direct averaging, or `none` to disable
+blending. With `none`, overlapping pixels are overwritten by the later tile in
+the layout order.

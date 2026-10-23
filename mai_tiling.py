@@ -324,7 +324,7 @@ class mAI_TilesToImage:
             "required": {
                 "tiles": ("IMAGE",),
                 "tile_layout": ("mAI_TILE_LAYOUT",),
-                "blend_mode": (["gradient_feathering", "hard_average"],),
+                "blend_mode": (["gradient_feathering", "hard_average", "none"],),
                 "scale_mode": (["auto", "manual"], {"default": "auto"}),
                 "manual_scale": ("FLOAT", {"default": 4.0, "min": 0.25, "max": 16.0, "step": 0.25}),
             }
@@ -418,8 +418,21 @@ class mAI_TilesToImage:
                             x_coords,
                             tiles.device,
                         )
-                    else:
+                    elif blend_mode == "hard_average":
                         mask = torch.ones((1, processed_tile_height, processed_tile_width, 1), device=tiles.device)
+                    elif blend_mode == "none":
+                        # Do not accumulate or average overlapping tiles. The
+                        # later tile in layout order overwrites the earlier one.
+                        y_end = scaled_y + processed_tile_height
+                        x_end = scaled_x + processed_tile_width
+                        reconstructed[b:b+1, scaled_y:y_end, scaled_x:x_end, :] = tile
+                        tile_idx += 1
+                        continue
+                    else:
+                        raise ValueError(
+                            "blend_mode must be 'gradient_feathering', "
+                            f"'hard_average', or 'none', got {blend_mode!r}"
+                        )
 
                     # Add the tile to the canvas and add its mask to the weight tracker
                     y_end = scaled_y + processed_tile_height
@@ -428,9 +441,10 @@ class mAI_TilesToImage:
                     weights[b:b+1, scaled_y:y_end, scaled_x:x_end, :] += mask
                     tile_idx += 1
 
-        # Normalize the canvas by dividing the pixels by the weight map (this guarantees 100% perfect math)
-        weights = torch.clamp(weights, min=1e-8)
-        reconstructed /= weights
+        # Normalize blended modes by dividing the pixels by the weight map.
+        if blend_mode != "none":
+            weights = torch.clamp(weights, min=1e-8)
+            reconstructed /= weights
 
         # Crop out any padding that was added at the start to perfectly match the original input
         final_image = reconstructed[:, :final_h, :final_w, :]
